@@ -518,6 +518,7 @@ pub const Loop = struct {
             },
 
             .cancel => |v| sqe.prep_cancel(@intCast(@intFromPtr(v.c)), 0),
+            .waitid => |v| linux.io_uring_prep_waitid(sqe, v.id_type, v.id, v.infop, v.options, 0),
         }
 
         // Our sqe user data always points back to the completion.
@@ -766,6 +767,12 @@ pub const Completion = struct {
                     else => |errno| posix.unexpectedErrno(errno),
                 },
             },
+            .waitid => .{
+                .waitid = if (res >= 0) {} else switch (@as(std.os.E, @enumFromInt(-res))) {
+                    .CHILD => error.NotFound,
+                    else => |errno| std.os.unexpectedErrno(errno),
+                },
+            },
         };
 
         return self.callback(self.userdata, loop, self, result);
@@ -850,6 +857,9 @@ pub const OperationType = enum {
 
     /// Cancel an existing operation.
     cancel,
+
+    /// Waitid
+    waitid,
 };
 
 /// The result type based on the operation type. For a callback, the
@@ -872,6 +882,7 @@ pub const Result = union(OperationType) {
     timer: TimerError!TimerTrigger,
     timer_remove: TimerRemoveError!void,
     cancel: CancelError!void,
+    waitid: WaitidError!void,
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1067,6 +1078,11 @@ pub const TimerError = error{
 pub const TimerRemoveError = error{
     NotFound,
     ExpirationInProgress,
+    Unexpected,
+};
+
+pub const WaitidError = error{
+    NotFound,
     Unexpected,
 };
 
@@ -1744,4 +1760,48 @@ test "io_uring: socket read cancellation" {
     try loop.run(.until_done);
     try testing.expectEqual(OperationType.read, @as(OperationType, read_result));
     try testing.expectError(error.Canceled, read_result.read);
+}
+
+test "io_uring: waitid" {
+    const testing = std.testing;
+
+    if (@import("builtin").os.isAtLeast(.linux, .{ .major = 6, .minor = 7, .patch = 0 }) == false) {
+        return error.SkipZigTest;
+    }
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    const pid = try std.os.fork();
+    if (pid == 0) {
+        std.os.exit(7);
+    }
+    var siginfo: std.os.siginfo_t = undefined;
+    var waitid_error: ?WaitidError = null;
+    var c_waitid = Completion{
+        .op = .{
+            .waitid = .{
+                .id_type = .PID,
+                .id = pid,
+                .infop = &siginfo,
+                .options = std.os.W.EXITED,
+            },
+        },
+        .userdata = &waitid_error,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, r: xev.Result) xev.CallbackAction {
+                const ptr = @as(*?WaitidError, @ptrCast(@alignCast(ud.?)));
+                r.waitid catch |err| {
+                    ptr.* = err;
+                };
+                return .disarm;
+            }
+        }).callback,
+    };
+    loop.add(&c_waitid);
+    try loop.run(.until_done);
+
+    try testing.expectEqual(null, waitid_error);
+    try testing.expectEqual(pid, siginfo.fields.common.first.piduid.pid);
+    try testing.expectEqual(7, siginfo.fields.common.second.sigchld.status);
 }
