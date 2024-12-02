@@ -518,7 +518,18 @@ pub const Loop = struct {
             },
 
             .cancel => |v| sqe.prep_cancel(@intCast(@intFromPtr(v.c)), 0),
-            .waitid => |v| linux.io_uring_prep_waitid(sqe, v.id_type, v.id, v.infop, v.options, 0),
+            .waitid => |v| {
+                const sqe_result = linux.IoUring.waitid(
+                    &self.ring,
+                    0,
+                    v.id_type,
+                    v.id,
+                    v.infop,
+                    v.options,
+                    0,
+                ) catch return;
+                sqe.* = sqe_result.*;
+            },
         }
 
         // Our sqe user data always points back to the completion.
@@ -768,9 +779,9 @@ pub const Completion = struct {
                 },
             },
             .waitid => .{
-                .waitid = if (res >= 0) {} else switch (@as(std.os.E, @enumFromInt(-res))) {
+                .waitid = if (res >= 0) {} else switch (@as(posix.E, @enumFromInt(-res))) {
                     .CHILD => error.NotFound,
-                    else => |errno| std.os.unexpectedErrno(errno),
+                    else => |errno| posix.unexpectedErrno(errno),
                 },
             },
         };
@@ -983,6 +994,13 @@ pub const Operation = union(OperationType) {
 
     cancel: struct {
         c: *Completion,
+    },
+
+    waitid: struct {
+        id_type: std.os.linux.P,
+        id: posix.pid_t,
+        infop: *posix.siginfo_t,
+        options: u32,
     },
 };
 
@@ -1772,11 +1790,11 @@ test "io_uring: waitid" {
     var loop = try Loop.init(.{});
     defer loop.deinit();
 
-    const pid = try std.os.fork();
+    const pid = try posix.fork();
     if (pid == 0) {
-        std.os.exit(7);
+        posix.exit(7);
     }
-    var siginfo: std.os.siginfo_t = undefined;
+    var siginfo: posix.siginfo_t = undefined;
     var waitid_error: ?WaitidError = null;
     var c_waitid = Completion{
         .op = .{
@@ -1784,7 +1802,7 @@ test "io_uring: waitid" {
                 .id_type = .PID,
                 .id = pid,
                 .infop = &siginfo,
-                .options = std.os.W.EXITED,
+                .options = posix.W.EXITED,
             },
         },
         .userdata = &waitid_error,
